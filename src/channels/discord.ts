@@ -1,4 +1,10 @@
-import { Client, Events, GatewayIntentBits, Message, TextChannel } from 'discord.js';
+import {
+  Client,
+  Events,
+  GatewayIntentBits,
+  Message,
+  TextChannel,
+} from 'discord.js';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -29,6 +35,19 @@ export class DiscordChannel implements Channel {
     this.opts = opts;
   }
 
+  /**
+   * Find all registered group JIDs that belong to a given Discord channel.
+   * Matches both plain JIDs (dc:123) and virtual JIDs (dc:123/agent).
+   */
+  private findGroupJidsForChannel(channelId: string): string[] {
+    const groups = this.opts.registeredGroups();
+    const plain = `dc:${channelId}`;
+    const virtualPrefix = `dc:${channelId}/`;
+    return Object.keys(groups).filter(
+      (jid) => jid === plain || jid.startsWith(virtualPrefix),
+    );
+  }
+
   async connect(): Promise<void> {
     this.client = new Client({
       intents: [
@@ -44,7 +63,6 @@ export class DiscordChannel implements Channel {
       if (message.author.bot) return;
 
       const channelId = message.channelId;
-      const chatJid = `dc:${channelId}`;
       let content = message.content;
       const timestamp = message.createdAt.toISOString();
       const senderName =
@@ -63,11 +81,18 @@ export class DiscordChannel implements Channel {
         chatName = senderName;
       }
 
+      // Find all registered groups for this channel (plain + virtual JIDs)
+      const matchingJids = this.findGroupJidsForChannel(channelId);
+      const isMultiAgent = matchingJids.length > 1;
+
       // Translate Discord @bot mentions into TRIGGER_PATTERN format.
       // Discord mentions look like <@botUserId> — these won't match
       // TRIGGER_PATTERN (e.g., ^@Andy\b), so we prepend the trigger
       // when the bot is @mentioned.
-      if (this.client?.user) {
+      // Skip translation for multi-agent channels — each agent has its
+      // own trigger (e.g., @Oracle, @Taskmaster) so the global trigger
+      // would mis-route.
+      if (this.client?.user && !isMultiAgent) {
         const botId = this.client.user.id;
         const isBotMentioned =
           message.mentions.users.has(botId) ||
@@ -84,22 +109,37 @@ export class DiscordChannel implements Channel {
             content = `@${ASSISTANT_NAME} ${content}`;
           }
         }
+      } else if (this.client?.user && isMultiAgent) {
+        // For multi-agent channels, strip <@botId> mentions but don't
+        // prepend any trigger — the raw text (e.g., "@Oracle ...") is
+        // delivered to all groups and each checks its own trigger.
+        const botId = this.client.user.id;
+        if (
+          content.includes(`<@${botId}>`) ||
+          content.includes(`<@!${botId}>`)
+        ) {
+          content = content
+            .replace(new RegExp(`<@!?${botId}>`, 'g'), '')
+            .trim();
+        }
       }
 
       // Handle attachments — store placeholders so the agent knows something was sent
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map((att) => {
-          const contentType = att.contentType || '';
-          if (contentType.startsWith('image/')) {
-            return `[Image: ${att.name || 'image'}]`;
-          } else if (contentType.startsWith('video/')) {
-            return `[Video: ${att.name || 'video'}]`;
-          } else if (contentType.startsWith('audio/')) {
-            return `[Audio: ${att.name || 'audio'}]`;
-          } else {
-            return `[File: ${att.name || 'file'}]`;
-          }
-        });
+        const attachmentDescriptions = [...message.attachments.values()].map(
+          (att) => {
+            const contentType = att.contentType || '';
+            if (contentType.startsWith('image/')) {
+              return `[Image: ${att.name || 'image'}]`;
+            } else if (contentType.startsWith('video/')) {
+              return `[Video: ${att.name || 'video'}]`;
+            } else if (contentType.startsWith('audio/')) {
+              return `[Audio: ${att.name || 'audio'}]`;
+            } else {
+              return `[File: ${att.name || 'file'}]`;
+            }
+          },
+        );
         if (content) {
           content = `${content}\n${attachmentDescriptions.join('\n')}`;
         } else {
@@ -123,33 +163,56 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Store chat metadata for discovery
+      // Store chat metadata for discovery (base JID for channel discovery)
+      const baseJid = `dc:${channelId}`;
       const isGroup = message.guild !== null;
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', isGroup);
+      this.opts.onChatMetadata(
+        baseJid,
+        timestamp,
+        chatName,
+        'discord',
+        isGroup,
+      );
 
-      // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
-      if (!group) {
+      if (matchingJids.length === 0) {
         logger.debug(
-          { chatJid, chatName },
+          { chatJid: baseJid, chatName },
           'Message from unregistered Discord channel',
         );
         return;
       }
 
-      // Deliver message — startMessageLoop() will pick it up
-      this.opts.onMessage(chatJid, {
-        id: msgId,
-        chat_jid: chatJid,
-        sender,
-        sender_name: senderName,
-        content,
-        timestamp,
-        is_from_me: false,
-      });
+      // For virtual JIDs, also store chat metadata so the messages
+      // foreign key (chat_jid → chats.jid) is satisfied.
+      for (const groupJid of matchingJids) {
+        if (groupJid !== baseJid) {
+          this.opts.onChatMetadata(
+            groupJid,
+            timestamp,
+            chatName,
+            'discord',
+            isGroup,
+          );
+        }
+      }
+
+      // Deliver message to all matching groups (plain or virtual JIDs).
+      // Each group has its own trigger pattern — the message loop will
+      // check triggers per group and only activate the addressed agent.
+      for (const groupJid of matchingJids) {
+        this.opts.onMessage(groupJid, {
+          id: `${msgId}${groupJid === baseJid ? '' : `:${groupJid}`}`,
+          chat_jid: groupJid,
+          sender,
+          sender_name: senderName,
+          content,
+          timestamp,
+          is_from_me: false,
+        });
+      }
 
       logger.info(
-        { chatJid, chatName, sender: senderName },
+        { channelId, chatName, sender: senderName, groupCount: matchingJids.length },
         'Discord message stored',
       );
     });
@@ -176,6 +239,36 @@ export class DiscordChannel implements Channel {
     });
   }
 
+  /**
+   * Parse a Discord JID (plain or virtual) into its channel ID and
+   * optional agent suffix.
+   *   "dc:123"        → { channelId: "123", agent: undefined }
+   *   "dc:123/oracle" → { channelId: "123", agent: "oracle" }
+   */
+  private static parseJid(jid: string): {
+    channelId: string;
+    agent: string | undefined;
+  } {
+    const raw = jid.replace(/^dc:/, '');
+    const slashIdx = raw.indexOf('/');
+    if (slashIdx === -1) return { channelId: raw, agent: undefined };
+    return {
+      channelId: raw.slice(0, slashIdx),
+      agent: raw.slice(slashIdx + 1),
+    };
+  }
+
+  /**
+   * Format an agent name for display: "oracle" → "Oracle"
+   */
+  private static formatAgentName(agent: string): string {
+    // Handle multi-word names separated by hyphens (e.g., "the-watcher" → "The Watcher")
+    return agent
+      .split('-')
+      .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+      .join(' ');
+  }
+
   async sendMessage(jid: string, text: string): Promise<void> {
     if (!this.client) {
       logger.warn('Discord client not initialized');
@@ -183,7 +276,7 @@ export class DiscordChannel implements Channel {
     }
 
     try {
-      const channelId = jid.replace(/^dc:/, '');
+      const { channelId, agent } = DiscordChannel.parseJid(jid);
       const channel = await this.client.channels.fetch(channelId);
 
       if (!channel || !('send' in channel)) {
@@ -193,16 +286,24 @@ export class DiscordChannel implements Channel {
 
       const textChannel = channel as TextChannel;
 
+      // For virtual JIDs (multi-agent channels), prefix messages with the
+      // agent's name so readers can tell which agent is speaking.
+      let finalText = text;
+      if (agent) {
+        const displayName = DiscordChannel.formatAgentName(agent);
+        finalText = `**[${displayName}]**\n${text}`;
+      }
+
       // Discord has a 2000 character limit per message — split if needed
       const MAX_LENGTH = 2000;
-      if (text.length <= MAX_LENGTH) {
-        await textChannel.send(text);
+      if (finalText.length <= MAX_LENGTH) {
+        await textChannel.send(finalText);
       } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await textChannel.send(text.slice(i, i + MAX_LENGTH));
+        for (let i = 0; i < finalText.length; i += MAX_LENGTH) {
+          await textChannel.send(finalText.slice(i, i + MAX_LENGTH));
         }
       }
-      logger.info({ jid, length: text.length }, 'Discord message sent');
+      logger.info({ jid, length: finalText.length }, 'Discord message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
     }
@@ -227,7 +328,7 @@ export class DiscordChannel implements Channel {
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     if (!this.client || !isTyping) return;
     try {
-      const channelId = jid.replace(/^dc:/, '');
+      const { channelId } = DiscordChannel.parseJid(jid);
       const channel = await this.client.channels.fetch(channelId);
       if (channel && 'sendTyping' in channel) {
         await (channel as TextChannel).sendTyping();

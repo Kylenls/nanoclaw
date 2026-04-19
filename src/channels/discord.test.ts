@@ -161,9 +161,7 @@ function createMessage(overrides: {
     member: overrides.memberDisplayName
       ? { displayName: overrides.memberDisplayName }
       : null,
-    guild: overrides.guildName
-      ? { name: overrides.guildName }
-      : null,
+    guild: overrides.guildName ? { name: overrides.guildName } : null,
     channel: {
       name: overrides.channelName ?? 'general',
       messages: {
@@ -641,8 +639,11 @@ describe('DiscordChannel', () => {
 
       await channel.sendMessage('dc:1234567890123456', 'Hello');
 
-      const fetchedChannel = await currentClient().channels.fetch('1234567890123456');
-      expect(currentClient().channels.fetch).toHaveBeenCalledWith('1234567890123456');
+      const fetchedChannel =
+        await currentClient().channels.fetch('1234567890123456');
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
     });
 
     it('strips dc: prefix from JID', async () => {
@@ -697,6 +698,64 @@ describe('DiscordChannel', () => {
       expect(mockChannel.send).toHaveBeenCalledTimes(2);
       expect(mockChannel.send).toHaveBeenNthCalledWith(1, 'x'.repeat(2000));
       expect(mockChannel.send).toHaveBeenNthCalledWith(2, 'x'.repeat(1000));
+    });
+
+    it('prefixes message with agent name for virtual JIDs', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendMessage('dc:1234567890123456/oracle', 'Market alert');
+
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
+      expect(mockChannel.send).toHaveBeenCalledWith(
+        '**[Oracle]**\nMarket alert',
+      );
+    });
+
+    it('formats multi-word agent names from virtual JIDs', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendMessage(
+        'dc:1234567890123456/the-watcher',
+        'Daily report',
+      );
+
+      expect(mockChannel.send).toHaveBeenCalledWith(
+        '**[The Watcher]**\nDaily report',
+      );
+    });
+
+    it('does not prefix for plain JIDs', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue(undefined),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendMessage('dc:1234567890123456', 'Hello');
+
+      expect(mockChannel.send).toHaveBeenCalledWith('Hello');
     });
   });
 
@@ -762,6 +821,178 @@ describe('DiscordChannel', () => {
       await channel.setTyping('dc:1234567890123456', true);
 
       // No error
+    });
+  });
+
+  // --- Multi-agent channels (virtual JIDs) ---
+
+  describe('multi-agent channels', () => {
+    function createMultiAgentOpts(
+      overrides?: Partial<DiscordChannelOpts>,
+    ): DiscordChannelOpts {
+      return {
+        onMessage: vi.fn(),
+        onChatMetadata: vi.fn(),
+        registeredGroups: vi.fn(() => ({
+          'dc:1234567890123456/oracle': {
+            name: 'Oracle',
+            folder: 'discord_arc2-oracle',
+            trigger: '@Oracle',
+            added_at: '2024-01-01T00:00:00.000Z',
+          },
+          'dc:1234567890123456/taskmaster': {
+            name: 'Taskmaster',
+            folder: 'discord_arc2-taskmaster',
+            trigger: '@Taskmaster',
+            added_at: '2024-01-01T00:00:00.000Z',
+          },
+          'dc:1234567890123456/the-watcher': {
+            name: 'The Watcher',
+            folder: 'discord_arc2-watcher',
+            trigger: '@Watcher',
+            added_at: '2024-01-01T00:00:00.000Z',
+          },
+        })),
+        ...overrides,
+      };
+    }
+
+    it('delivers message to all virtual JIDs for the channel', async () => {
+      const opts = createMultiAgentOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        content: '@Oracle what should we buy?',
+        guildName: 'Comic Shop HQ',
+        channelName: 'arc2-agents',
+      });
+      await triggerMessage(msg);
+
+      // Message should be delivered to all three virtual JIDs
+      expect(opts.onMessage).toHaveBeenCalledTimes(3);
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456/oracle',
+        expect.objectContaining({
+          chat_jid: 'dc:1234567890123456/oracle',
+          content: '@Oracle what should we buy?',
+        }),
+      );
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456/taskmaster',
+        expect.objectContaining({
+          chat_jid: 'dc:1234567890123456/taskmaster',
+        }),
+      );
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456/the-watcher',
+        expect.objectContaining({
+          chat_jid: 'dc:1234567890123456/the-watcher',
+        }),
+      );
+    });
+
+    it('does not translate @bot mention to global trigger for multi-agent channels', async () => {
+      const opts = createMultiAgentOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        content: '<@999888777> check prices',
+        mentionsBotId: true,
+        guildName: 'Comic Shop HQ',
+      });
+      await triggerMessage(msg);
+
+      // Should strip the mention but NOT prepend @Andy
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456/oracle',
+        expect.objectContaining({
+          content: 'check prices',
+        }),
+      );
+    });
+
+    it('uses unique message IDs per virtual JID', async () => {
+      const opts = createMultiAgentOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        content: 'hello agents',
+        messageId: 'msg_042',
+        guildName: 'Server',
+      });
+      await triggerMessage(msg);
+
+      const ids = (opts.onMessage as any).mock.calls.map(
+        (call: any) => call[1].id,
+      );
+      // All IDs should be unique
+      expect(new Set(ids).size).toBe(3);
+    });
+
+    it('stores metadata for base JID and all virtual JIDs', async () => {
+      const opts = createMultiAgentOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        content: 'hello',
+        guildName: 'Comic Shop HQ',
+        channelName: 'arc2-agents',
+      });
+      await triggerMessage(msg);
+
+      // Base JID + 3 virtual JIDs = 4 metadata calls
+      expect(opts.onChatMetadata).toHaveBeenCalledTimes(4);
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.any(String),
+        'Comic Shop HQ #arc2-agents',
+        'discord',
+        true,
+      );
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:1234567890123456/oracle',
+        expect.any(String),
+        'Comic Shop HQ #arc2-agents',
+        'discord',
+        true,
+      );
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:1234567890123456/taskmaster',
+        expect.any(String),
+        'Comic Shop HQ #arc2-agents',
+        'discord',
+        true,
+      );
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:1234567890123456/the-watcher',
+        expect.any(String),
+        'Comic Shop HQ #arc2-agents',
+        'discord',
+        true,
+      );
+    });
+
+    it('setTyping works with virtual JIDs', async () => {
+      const opts = createMultiAgentOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const mockChannel = {
+        send: vi.fn(),
+        sendTyping: vi.fn().mockResolvedValue(undefined),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.setTyping('dc:1234567890123456/oracle', true);
+
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        '1234567890123456',
+      );
+      expect(mockChannel.sendTyping).toHaveBeenCalled();
     });
   });
 

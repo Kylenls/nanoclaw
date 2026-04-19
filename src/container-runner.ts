@@ -17,6 +17,7 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
@@ -28,6 +29,58 @@ import {
 import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+
+const AIRTABLE_ENV_KEYS = [
+  'AIRTABLE_TOKEN',
+  'AIRTABLE_BASE',
+  'AIRTABLE_INV_TABLE',
+  'AIRTABLE_CASH_TABLE',
+  'AIRTABLE_REC_TABLE',
+  'AIRTABLE_FOC_QUEUE_TABLE',
+];
+
+const EBAY_ENV_KEYS = [
+  'EBAY_APP_ID',
+  'EBAY_DEV_ID',
+  'EBAY_CERT_ID',
+  'EBAY_USER_TOKEN',
+  'EBAY_OAUTH_TOKEN',
+  'EBAY_REFRESH_TOKEN',
+];
+
+// UID/GID the containerized `node` user runs as (node:slim base image).
+// Must match the Dockerfile's USER directive — kept in sync manually.
+const CONTAINER_NODE_UID = 1000;
+const CONTAINER_NODE_GID = 1000;
+
+// Root on the host can't share ownership with a uid-1000 container user, so
+// any writable bind-mounted directory has to be chowned to 1000:1000 or the
+// agent gets EACCES when it tries to write. No-op when the host process is
+// not root (bind mounts already line up) or on platforms without POSIX
+// ownership (getuid is undefined on native Windows).
+function chownForContainer(target: string, recursive: boolean): void {
+  if (process.getuid?.() !== 0) return;
+  const walk = (p: string): void => {
+    try {
+      fs.chownSync(p, CONTAINER_NODE_UID, CONTAINER_NODE_GID);
+    } catch (err) {
+      logger.warn({ err, path: p }, 'chown to container uid failed');
+      return;
+    }
+    if (!recursive) return;
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(p);
+    } catch {
+      return;
+    }
+    if (!stat.isDirectory()) return;
+    for (const entry of fs.readdirSync(p)) {
+      walk(path.join(p, entry));
+    }
+  };
+  walk(target);
+}
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
@@ -144,6 +197,7 @@ function buildVolumeMounts(
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
+  chownForContainer(groupSessionsDir, false);
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(
@@ -169,16 +223,24 @@ function buildVolumeMounts(
   }
 
   // Sync skills from container/skills/ into each group's .claude/skills/
+  // Groups listed here are excluded from specific skills (e.g. API-only agents
+  // that should never browse the web).
+  const SKILL_EXCLUSIONS: Record<string, string[]> = {
+    'agent-browser': ['discord_arc2-taskmaster'],
+  };
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
   if (fs.existsSync(skillsSrc)) {
     for (const skillDir of fs.readdirSync(skillsSrc)) {
+      const excluded = SKILL_EXCLUSIONS[skillDir] ?? [];
+      if (excluded.includes(group.folder)) continue;
       const srcDir = path.join(skillsSrc, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
       fs.cpSync(srcDir, dstDir, { recursive: true });
     }
   }
+  chownForContainer(groupSessionsDir, true);
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',
@@ -191,6 +253,7 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  chownForContainer(groupIpcDir, true);
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -222,6 +285,7 @@ function buildVolumeMounts(
         fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
     if (needsCopy) {
       fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+      chownForContainer(groupAgentRunnerDir, true);
     }
   }
   mounts.push({
@@ -252,6 +316,21 @@ async function buildContainerArgs(
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Forward Airtable credentials so ARC2 agents can query the inventory base.
+  // Values come from .env (preferred) with process.env fallback.
+  const airtableEnv = readEnvFile(AIRTABLE_ENV_KEYS);
+  for (const key of AIRTABLE_ENV_KEYS) {
+    const value = airtableEnv[key] ?? process.env[key];
+    if (value) args.push('-e', `${key}=${value}`);
+  }
+
+  // Forward eBay API credentials for Taskmaster store operations.
+  const ebayEnv = readEnvFile(EBAY_ENV_KEYS);
+  for (const key of EBAY_ENV_KEYS) {
+    const value = ebayEnv[key] ?? process.env[key];
+    if (value) args.push('-e', `${key}=${value}`);
+  }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
