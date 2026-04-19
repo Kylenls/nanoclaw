@@ -212,7 +212,12 @@ export class DiscordChannel implements Channel {
       }
 
       logger.info(
-        { channelId, chatName, sender: senderName, groupCount: matchingJids.length },
+        {
+          channelId,
+          chatName,
+          sender: senderName,
+          groupCount: matchingJids.length,
+        },
         'Discord message stored',
       );
     });
